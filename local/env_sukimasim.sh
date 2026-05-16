@@ -10,8 +10,11 @@
 # Note: keep this script side-effect-free except for environment exports.
 # In particular it does NOT call `git submodule update --remote`
 # (the official setup_env.sh does, which can silently advance submodules).
-
-set -euo pipefail
+#
+# We deliberately do NOT `set -euo pipefail` here: source-time `set -u` leaks
+# into the caller's interactive shell and breaks the prompt / snapshot
+# restore on common setups (e.g. anything that probes ZSH_VERSION
+# unconditionally). Each driver in local/run_*.sh sets its own strict flags.
 
 # Resolve the project directory as the parent of local/.
 _THIS_FILE="${BASH_SOURCE[0]}"
@@ -81,12 +84,30 @@ if [ -z "${GMP_DIR:-}" ]; then
       export GMP_DIR="${d}"
       break
     fi
+    # Debian/Ubuntu multiarch layout: header lives at
+    # ${d}/include/<triplet>/gmp.h. The Makefile only passes
+    # -I${GMP_DIR}/include, so add the multiarch dir to CPATH so g++
+    # can still find <gmp.h> via the standard search path.
+    _multiarch_h=$(ls "${d}/include/"*"-linux-gnu/gmp.h" 2>/dev/null | head -1)
+    if [ -n "${_multiarch_h}" ]; then
+      export GMP_DIR="${d}"
+      _multiarch_incdir="$(dirname "${_multiarch_h}")"
+      export CPATH="${_multiarch_incdir}${CPATH:+:${CPATH}}"
+      break
+    fi
   done
 fi
 if [ -z "${MPFR_DIR:-}" ]; then
   for d in /usr /usr/local /opt/homebrew /home/linuxbrew/.linuxbrew; do
     if [ -e "${d}/include/mpfr.h" ]; then
       export MPFR_DIR="${d}"
+      break
+    fi
+    _multiarch_h=$(ls "${d}/include/"*"-linux-gnu/mpfr.h" 2>/dev/null | head -1)
+    if [ -n "${_multiarch_h}" ]; then
+      export MPFR_DIR="${d}"
+      _multiarch_incdir="$(dirname "${_multiarch_h}")"
+      export CPATH="${_multiarch_incdir}${CPATH:+:${CPATH}}"
       break
     fi
   done
