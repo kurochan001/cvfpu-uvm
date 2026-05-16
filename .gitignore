@@ -13,3 +13,7 @@ simu/*.do
 simu/*.tcl
 .bender/
 Bender.lock
+
+# sukimasim bringup local artefacts
+output/
+.venv/

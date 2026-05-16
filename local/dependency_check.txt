@@ -1,0 +1,53 @@
+# Dependency check for CVFPU UVM DV environment
+# Date: 2026-05-16
+# Host: Linux DESKTOP-BG4C01Q (WSL2, Ubuntu/Debian-like)
+# Working dir: /home/bamba/Work2/CVFPU/cvfpu_uvm_bringup/cvfpu-uvm
+
+[OK]   python3   : /home/linuxbrew/.linuxbrew/bin/python3  (Python 3.14.0, via linuxbrew)
+[OK]   pip3      : /home/linuxbrew/.linuxbrew/bin/pip3     (pip 25.2 -> upgraded to 26.1.1 in .venv)
+[OK]   make      : /usr/bin/make (GNU Make 4.3)
+[OK]   gcc       : /usr/bin/gcc  (Ubuntu 14.3.0-12ubuntu1~24~ppa1)
+[OK]   g++       : /usr/bin/g++  (Ubuntu 14.3.0-12ubuntu1~24~ppa1)
+[OK]   perl      : /usr/bin/perl (v5.38.2)
+[OK]   git       : /usr/bin/git  (2.43.0)
+
+[MISS] bender    : not in PATH
+                   -> required by ${SCRIPTS_DIR}/compile.py for filelist generation:
+                        bender update
+                        bender script flist-plus -t cv64a60ax_cvfpu_uvm -t cvfpu_uvm > simu/bender_filelist.f
+                   -> install (no sudo): cargo install bender
+                      or download static binary from https://github.com/pulp-platform/bender/releases
+
+[PART] GMP       : runtime libs present (libgmp.so.10, libgmpxx.so.4 in /lib/x86_64-linux-gnu)
+                   pkg-config gmp -> 6.3.0
+                   BUT development headers (gmp.h) are MISSING.
+                   -> required by ref_model_csim/cpp/Makefile (-I$(GMP_DIR)/include)
+                   -> needed package: libgmp-dev (apt-get install libgmp-dev)  [sudo, NOT executed]
+
+[PART] MPFR      : runtime lib present (libmpfr.so.6 in /lib/x86_64-linux-gnu)
+                   BUT development headers (mpfr.h) are MISSING and no mpfr.pc.
+                   -> required by ref_model_csim/cpp/Makefile (-I$(MPFR_DIR)/include and -lmpfr)
+                   -> needed package: libmpfr-dev (apt-get install libmpfr-dev)  [sudo, NOT executed]
+                   -> README recommends MPFR 4.2.2; system likely has 4.2.x
+
+[MISS] sukimasim : not in PATH, env SUKIMASIM_BIN unset
+                   -> bringup script generation continues; compile/run skipped.
+
+[INFO] commercial simulators:
+  vlog (questa) : NOT FOUND
+  xrun (xcelium): NOT FOUND
+  vcs           : NOT FOUND
+
+[INFO] open-source simulator detected:
+  verilator     : /usr/local/bin/verilator  (not officially supported by cvfpu-uvm)
+
+[INFO] venv:
+  python3 -m venv .venv      -> OK
+  pip install -r requirements.txt -> OK (only pyyaml)
+
+Conclusion:
+  - Official flow blocked by: bender (filelist) AND any of questa/xcelium/vcs.
+  - C++ refmodel build blocked by: missing libgmp-dev / libmpfr-dev headers
+    (and GMP_DIR / MPFR_DIR layout: Makefile expects $(GMP_DIR)/include and $(GMP_DIR)/lib,
+    so even with the dev packages a wrapper that points at /usr is needed).
+  - sukimasim bringup blocked by: tool not present on PATH and not in SUKIMASIM_BIN.
