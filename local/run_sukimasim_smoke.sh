@@ -50,7 +50,9 @@ fi
 DPILIB="${PROJECT_DIR}/ref_model_csim/cpp/build/refmodel_csim_lib.so"
 DPI_OPTS=()
 if [ -e "${DPILIB}" ]; then
-  DPI_OPTS+=( --lib-path "$(dirname "${DPILIB}")" --lib "$(basename "${DPILIB}" .so)" )
+  # See run_sukimasim_compile.sh for the rationale: keep the .so suffix so
+  # sukimasim's dlopen does not synthesise an extra `lib` prefix.
+  DPI_OPTS+=( --lib-path "$(dirname "${DPILIB}")" --lib "$(basename "${DPILIB}")" )
   export LD_LIBRARY_PATH="$(dirname "${DPILIB}"):${LD_LIBRARY_PATH:-}"
 else
   echo "[WARN] DPI shared lib not built; refmodel DPI calls will fail to bind." >&2

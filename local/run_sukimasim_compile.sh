@@ -79,9 +79,12 @@ fi
 DPILIB="${PROJECT_DIR}/ref_model_csim/cpp/build/refmodel_csim_lib.so"
 DPI_OPTS=()
 if [ -e "${DPILIB}" ]; then
-  # `--lib NAME` looks up libNAME.so or NAME.so on lib-path. Easiest: pass
-  # the containing dir on --lib-path and the basename (without .so) on --lib.
-  DPI_OPTS+=( --lib-path "$(dirname "${DPILIB}")" --lib "$(basename "${DPILIB}" .so)" )
+  # sukimasim's `--lib NAME` follows the Unix dlopen convention: a bare name
+  # would resolve to `libNAME.so`, but our refmodel ships as
+  # `refmodel_csim_lib.so` (no `lib` prefix, matching the official Questa /
+  # VCS / Xcelium `-sv_lib` argument), so we pass the full basename
+  # *with* the .so suffix to keep dlopen happy.
+  DPI_OPTS+=( --lib-path "$(dirname "${DPILIB}")" --lib "$(basename "${DPILIB}")" )
   export LD_LIBRARY_PATH="$(dirname "${DPILIB}"):${LD_LIBRARY_PATH:-}"
 else
   echo "[WARN] DPI shared lib not built: ${DPILIB}" >&2
