@@ -17,3 +17,4 @@ Bender.lock
 # sukimasim bringup local artefacts
 output/
 .venv/
+local/cvfpu_uvm_sukimasim.bender.f
