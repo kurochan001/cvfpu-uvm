@@ -4,13 +4,13 @@
 
 | field           | value                                                          |
 |-----------------|----------------------------------------------------------------|
-| date            | 2026-05-16                                                     |
+| date            | 2026-05-16 (initial) → 2026-05-17 (post-#265, NBA SEGV captured) |
 | host OS         | Ubuntu 24.04.4 LTS (WSL2, kernel 6.6.87.2-microsoft-standard)  |
 | working dir     | `/home/bamba/Work2/cvfpu-uvm`                                  |
 | repo (origin)   | https://github.com/kurochan001/cvfpu-uvm.git (fork, private)   |
 | repo (upstream) | https://github.com/openhwgroup/cvfpu-uvm.git                   |
 | branch / HEAD   | `sukimasim-bringup` @ `4bcc8fc`                                |
-| sukimasim       | v0.9.9.2 at `/home/bamba/Work2/sukimasim/build/sukimasim` (`3259f7c44`) |
+| sukimasim       | v0.9.9.2 at `/home/bamba/Work2/sukimasim/build/sukimasim` (HEAD `49826e013`, includes #265 fix `d99e191f6`) |
 | user            | pirochan7@outlook.jp                                            |
 
 ## Submodule status
@@ -141,9 +141,11 @@ omits the `--remote` so we stay on the pinned SHAs.
 - Notable testbench-quality nits surfaced (worth filing upstream):
   - 8× `PITFALL-NON-VIRTUAL-OVERRIDE` on `base_test::create` shadowed
     by `fpu_*_test::create`.
-  - `PITFALL-NULL-HANDLE` on `xrtl_reset_vif::hvl_obj` — see
-    [sukimasim#265](https://github.com/kurochan001/sukimasim/issues/265),
-    this is the suspected SIGSEGV cause below.
+  - `PITFALL-NULL-HANDLE` on `xrtl_reset_vif::hvl_obj` — closely
+    correlated with both [sukimasim#265](https://github.com/kurochan001/sukimasim/issues/265)
+    (CLOSED, class-handle method dispatch path) and the still-open
+    [sukimasim#270](https://github.com/kurochan001/sukimasim/issues/270)
+    (NBA-region callback path). See the Smoke section below.
   - `PITFALL-TASK-STATIC-DEFAULT` on `wait_n_clocks`.
   - Several `PITFALL-INPUT-KIND-SURPRISE` (input ports declared without
     explicit `var`/`wire`).
@@ -151,27 +153,41 @@ omits the `--remote` so we stay on the pinned SHAs.
     target-gating artefact (`CVA6Cfg.FpPresent` propagation through
     the cva6 closure), not a real testbench bug. Not yet investigated.
 
-## Smoke run result — **SIGSEGV at run_phase / RESET START**
+## Smoke run result — **SIGSEGV in NBA region (post-#265)**
 
 - Driver: `local/run_sukimasim_smoke.sh`.
 - Defaults: `TESTNAME=fpu_random_test`, `SEED=1`, `VERBOSITY=UVM_LOW`,
   `NB_TXNS=1`, `MAX_TIME=1ms`, `WALL_TIMEOUT=60`.
-- Progress before the crash (sim time 0):
-  - UVM `build_phase` → `connect_phase` → `end_of_elaboration_phase`
-    → `start_of_simulation_phase` → `run_phase` → `reset_phase` all
-    completed.
-  - Clock driver started, watchdog armed (30 ms), reset driver entered
-    `[RESET START] RESET START (0 active)`.
-  - Next line: `[FATAL] Signal caught: SIGSEGV (Segmentation fault)`,
-    exit `139`.
-- Hypothesis: lint already flagged `xrtl_reset_vif::hvl_obj` as a
-  null handle (`PITFALL-NULL-HANDLE`). The reset driver touches that
-  handle immediately after emitting `[RESET START]`, which lines up
-  exactly with the SIGSEGV location.
-- Filed against sukimasim as
-  [sukimasim#265](https://github.com/kurochan001/sukimasim/issues/265):
-  catch null-handle dereference as an IEEE 1800-2023 §8.6 runtime error
-  (or UVM_FATAL) rather than letting the OS deliver SIGSEGV.
+- History of the smoke walking forward as sukimasim fixes land:
+
+  | sukimasim build       | furthest UVM step reached                       | crash signature                                           |
+  |-----------------------|--------------------------------------------------|------------------------------------------------------------|
+  | `3259f7c44` (pre-#265)| `reset_phase` → reset_driver `[RESET START] RESET START (0 active)` | `[FATAL] Signal caught: SIGSEGV (Segmentation fault)` from sukimasim's own handler, exit 139 |
+  | `49826e013` (post-#265, current) | `pre_reset_phase` then `reset_phase`, **before** `[RESET START]` | bash-level `Segmentation fault (core dumped)`, exit 139; no `RUNTIME_NULL_OBJECT`, no sukimasim FATAL line |
+
+- Post-#265 backtrace (from `gdb --batch --args ${SUKIMASIM_BIN} ...
+  -ex run -ex 'bt 40'`, full log at `output/sukimasim/gdb_smoke.log`):
+  ```
+  #0  TestbenchRuntime::TestbenchRuntime(ModuleIR*, ostream&)::$_4 (lambda)
+      signature: void(const string&, const shared_ptr<ir::Value>&)
+  #1  NBAFullEvent::execute()
+  #2  FullDeltaScheduler::executeRegion(FullRegion)
+  #3  FullDeltaScheduler::executeDeltaCycle()
+  #4  TestbenchRuntime::executeDeltaCyclesOnce()
+  #5  TestbenchRuntime::executeUVMRuntimePhasesFromIndex(unsigned long)
+  #6  TestbenchRuntime::executeUVMTest("fpu_random_test")
+  ...
+  #20 main
+  ```
+- Interpretation: the #265 fix removed the null-method-receiver trip,
+  so reset_driver walks one delta-cycle further into the NBA region;
+  the next null/dangling reference is inside the NBA-update callback
+  registered in `TestbenchRuntime`'s ctor, not a class-method dispatch.
+  Same likely root cause (`xrtl_reset_vif::hvl_obj` going through a
+  non-blocking assignment) but a different code path inside sukimasim.
+- Filed as
+  [sukimasim#270](https://github.com/kurochan001/sukimasim/issues/270);
+  cross-linked from #265 ([comment](https://github.com/kurochan001/sukimasim/issues/265#issuecomment-4469489094)).
 
 ## Generated files
 
@@ -184,21 +200,24 @@ local/build_refmodel_sukimasim.sh       # builds refmodel_csim_lib.so (PASS)
 local/cvfpu_uvm_sukimasim.f             # entrypoint filelist (31 lines)
 local/cvfpu_uvm_sukimasim.bender.f      # gitignored, regenerate via bender
 local/run_sukimasim_compile.sh          # --compile-only PASS
-local/run_sukimasim_smoke.sh            # reaches RESET START, SIGSEGV
+local/run_sukimasim_smoke.sh            # reaches reset_phase NBA, SIGSEGV
 local/log_summary.md
-local/sukimasim_issue_draft.md          # body of sukimasim#265
+local/sukimasim_issue_draft.md          # body of sukimasim#265 (CLOSED)
+local/sukimasim_issue_nba_segv_draft.md # body of sukimasim#270 (OPEN)
 ref_model_csim/cpp/build/refmodel_csim_lib.so   # gitignored (*.so)
 output/sukimasim/compile.log            # gitignored
 output/sukimasim/lint.log
+output/sukimasim/gdb_smoke.log          # gitignored, sim phase
 output/sukimasim/cmd.txt
 output/sukimasim/version.txt
 output/sukimasim/work/                  # sukimasim work dir
 ```
 
-Still no `local/repros/` — sukimasim#265 carries the symptom + repro
-recipe, and the SIGSEGV is too entangled with the cvfpu-uvm UVM stack
-right now to extract a 10-line isolated reproducer cheaply. Revisit
-when fixing the null-handle path forces a smaller test case.
+Still no `local/repros/` — sukimasim#265 and #270 carry the symptom +
+repro recipe, and the SIGSEGV is too entangled with the cvfpu-uvm UVM
+stack right now to extract a 10-line isolated reproducer cheaply.
+Revisit if #270 needs an `-O0` rebuild for richer locals or if the
+fix surfaces a third null path one delta-cycle deeper.
 
 ## Exact commands to reproduce (from a clean clone)
 
@@ -206,7 +225,7 @@ when fixing the null-handle path forces a smaller test case.
 # 1. clone + submodules
 git clone https://github.com/kurochan001/cvfpu-uvm.git ~/Work2/cvfpu-uvm
 cd ~/Work2/cvfpu-uvm
-git checkout sukimasim-bringup        # at 4bcc8fc
+git checkout sukimasim-bringup        # at 9ebc04d or newer
 git submodule update --init --recursive
 
 # 2. python venv
@@ -234,23 +253,37 @@ bash local/build_refmodel_sukimasim.sh
 # 7. compile-only — PASS
 bash local/run_sukimasim_compile.sh
 
-# 8. smoke — SIGSEGV at RESET START (sukimasim#265)
+# 8. smoke — currently SIGSEGV in NBA region (sukimasim#270)
 bash local/run_sukimasim_smoke.sh
+
+# 9. (optional) capture backtrace under gdb
+gdb --batch --args "${SUKIMASIM_BIN}" \
+    --enable-uvm --preprocess -top top \
+    --work-dir output/sukimasim/work --errormax 1 \
+    --seed 1 --max-time 1ms --wall-timeout 60 \
+    -f local/cvfpu_uvm_sukimasim.f \
+    --lib-path ref_model_csim/cpp/build --lib refmodel_csim_lib.so \
+    +define+SUKIMASIM "+incdir+${PROJECT_DIR}" \
+    +UVM_TESTNAME=fpu_random_test +UVM_VERBOSITY=UVM_LOW \
+    +NB_TXNS=1 +TIMEOUT=30000000 \
+    -ex 'run' -ex 'bt 40' -ex 'thread apply all bt 20'
 ```
 
 ## Blockers (ordered)
 
-1. **`xrtl_reset_vif::hvl_obj` null-handle access → sukimasim SIGSEGV.**
-   Tracked in [sukimasim#265](https://github.com/kurochan001/sukimasim/issues/265).
-   Unblocks the smoke run; until then `fpu_random_test +NB_TXNS=1` cannot
-   exit 0. Two possible resolutions:
-   - **sukimasim side:** turn the lint-detected `PITFALL-NULL-HANDLE`
-     into a runtime guard, so null-deref produces an SV runtime error
-     instead of OS SIGSEGV (preferred — fixes a whole class of crashes).
+1. **NBA-region SIGSEGV after #265 fix.** Tracked in
+   [sukimasim#270](https://github.com/kurochan001/sukimasim/issues/270).
+   Reset driver progresses through `pre_reset_phase` into `reset_phase`
+   and crashes inside the NBA-update callback registered by
+   `TestbenchRuntime`'s ctor. Two possible resolutions:
+   - **sukimasim side (preferred):** validate the NBA target lookup
+     (or wrap the callback with the same null-guard machinery #265
+     added for method dispatch) so the deref surfaces as an SV runtime
+     error rather than OS SIGSEGV.
    - **testbench side:** construct `xrtl_reset_vif::hvl_obj` (`new()`)
-     before the reset driver enters its run loop. Would silence this
-     specific case but does not fix the sukimasim crash mode for other
-     null handles.
+     before the reset driver enters its run loop. The lint warning
+     `PITFALL-NULL-HANDLE` still points at the same handle, so the
+     workaround silences both #265 and #270 symptoms for this TB.
 2. **`fpu_wrap` outputs reported as UNDRIVEN by `--lint`** —
    `CVA6Cfg.FpPresent` parameter propagation or sukimasim's generate-
    block elaboration depth. Investigate only after the SIGSEGV is gone,
@@ -258,14 +291,26 @@ bash local/run_sukimasim_smoke.sh
 3. **Testbench-quality nits** (8 non-virtual `create` overrides,
    `wait_n_clocks` static lifetime, missing `var`/`wire` kinds on a few
    input ports). Not blockers; file upstream against cvfpu-uvm after
-   the SIGSEGV is resolved.
+   the smoke is green.
+
+### Resolved (kept for history)
+
+- **#265 — null class-handle method dispatch → SIGSEGV.** CLOSED by
+  `d99e191f6` (`Fix null class handle method calls`). Surfaces as
+  `RUNTIME_NULL_OBJECT` SV runtime error on non-UVM-lazy-stub
+  receivers; UVM lazy-stub / `current_phase` paths intentionally left
+  out to avoid false positives.
 
 ## Next actions
 
-- Wait on / track [sukimasim#265](https://github.com/kurochan001/sukimasim/issues/265).
-  Once a sukimasim build catches null-handle deref, re-run
-  `bash local/run_sukimasim_smoke.sh` and follow whatever symptom
-  surfaces next.
+- Wait on / track [sukimasim#270](https://github.com/kurochan001/sukimasim/issues/270).
+  Once a fix lands, rebuild sukimasim (note: clear ccache or
+  `CCACHE_DISABLE=1` — a stale ccache hit a phantom
+  `SymbolKind::TypeAliasType` reference during this round) and rerun
+  `bash local/run_sukimasim_smoke.sh`.
+- If #270 stalls on lack of locals, rebuild sukimasim at `-O0` and
+  re-capture the bt — the captured-variable layer in the lambda
+  `$_4` would name the actual NBA target.
 - (Optional, parallelisable) extend `run_sukimasim_compile.sh`'s
   `--lib` wiring into a thin `run_sukimasim_lint.sh` so `--lint`
   also exits 0 with DPI resolved.
@@ -273,10 +318,11 @@ bash local/run_sukimasim_smoke.sh
 
 ## Status
 
-**SMOKE_SIGSEGV_AT_RESET_START**
+**SMOKE_NBA_SEGV_POST_265**
 
-Reason: every pre-smoke stage now passes (`--compile-only`, DPI library
-load, `--lint` analysis, refmodel `.so` build). `fpu_random_test`
-reaches UVM `reset_phase` and dies with SIGSEGV the moment the reset
-driver starts touching `xrtl_reset_vif::hvl_obj`. Captured upstream
-as sukimasim#265; cvfpu-uvm side is currently parked.
+Reason: sukimasim#265 is CLOSED (`d99e191f6`); a rebuilt sukimasim
+(HEAD `49826e013`) walks the smoke one delta-cycle further — through
+`pre_reset_phase` and into `reset_phase` — before SIGSEGV inside the
+NBA-region callback registered in `TestbenchRuntime`'s ctor. Captured
+upstream as sukimasim#270 with full backtrace; cvfpu-uvm side is
+currently parked on that.
