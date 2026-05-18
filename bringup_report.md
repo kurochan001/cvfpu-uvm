@@ -256,27 +256,36 @@ source local/env_sukimasim.sh
 ## Blockers (ordered)
 
 1. **FPU pipeline response not propagating — `FPU_SB_REQ` arrives but
-   `FPU_SB_RSP` never does.**
+   `FPU_SB_RSP` never does** (plus an in-progress request-side
+   regression observed on the latest WIP binary).
    Tracked on
-   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4477335316).
-   After codex landed the local `Issue280WaitZeroTaskJoinAny` fix,
-   `[DISABLE FORK]` zero-delay loop is gone and one transaction
-   walks the full path
-   `driver → DUT inputs → monitor → analysis_port → scoreboard`:
-   ```
-   [UVM_INFO] @ 50501: fpu_random_test [TEST] main_phase
-   [UVM_INFO] @ 51501: fpu_monitor [DBG] MON-REQ seen at 51ns
-   [UVM_INFO] @ 51501: fpu_sb      [FPU_SB_REQ] OP=ADD, OP_A=0(x), ...
-   [TIMEOUT] Wall-clock timeout reached (40s) ... at time 84501
-   ```
-   After the req is logged, sim_time advances from `51501` →
-   `84501` (33 ns of FPU pipeline activity), then the host runs
-   out of wall budget without `fpu_valid_o` ever firing. So the
-   request side is fully alive but the response chain inside
-   `fpu_gen.i_fpnew_bulk` (`fpnew_top`) is not propagating
-   `out_valid` back to the monitor. Wall/sim ratio is ~600× even
-   after the wait(0) fix, so stretching `WALL_TIMEOUT=600` would
-   only buy ~1 ms of sim — same regime.
+   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4477335316)
+   (response side) and
+   [#issuecomment-4478045917](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4478045917)
+   (request-side regression on `mtime 22:07` WIP).
+   - **18:48 binary (`Issue280WaitZeroTaskJoinAny` only)**: one
+     transaction walks the full request path
+     `driver → DUT inputs → monitor → analysis_port → scoreboard`:
+     ```
+     @ 50501 [TEST] main_phase
+     @ 51501 fpu_monitor [DBG] MON-REQ seen at 51ns
+     @ 51501 fpu_sb      [FPU_SB_REQ] OP=ADD, OP_A=0(x), ...
+     [TIMEOUT] ... at time 84501
+     ```
+     `FPU_SB_RSP` never arrives — response chain inside
+     `fpu_gen.i_fpnew_bulk` (`fpnew_top`) is not propagating
+     `out_valid` back to the monitor. Wall/sim ratio ~600× so
+     stretching `WALL_TIMEOUT` only buys microseconds of sim.
+   - **22:07 binary (+ `Issue280VifPackedStructMemberNba`,
+     `Issue280GenerateChildPortScope`, fpnew cast-actual WIP)**:
+     `[DISABLE FORK]` still gone, but the request now no longer
+     reaches the monitor either — `MON-REQ` count goes from 1 to
+     0 on plain `make smoke` (UVM_LOW, seed=1, no VCD). VCD-on
+     attempt produces a 0-byte VCD because the run is wall-killed
+     before the writer flushes, so I cannot reproduce codex's
+     "VCD 付きで FPU_SB_REQ 到達" path locally. Waiting on codex
+     for the exact VCD invocation or for the WIP edits to be
+     bisected.
 
    **Earlier residuals folded into Resolved** (in time order, all
    now upstream-fixed): `q_inflight_tid` "not an array" →
@@ -383,8 +392,8 @@ source local/env_sukimasim.sh
 
 ## Status
 
-**SMOKE_FPU_RESPONSE_NOT_PROPAGATING**
-(was `SMOKE_DISABLE_FORK_ZERO_DELAY_LOOP_IN_MAIN_PHASE`)
+**SMOKE_FPU_RESPONSE_NOT_PROPAGATING_PLUS_WIP_REQ_REGRESSION**
+(was `SMOKE_FPU_RESPONSE_NOT_PROPAGATING`)
 
 Reason:
 - Compile + lint (PITFALL=off) PASS green, regression-tracked in
