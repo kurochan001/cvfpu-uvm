@@ -57,6 +57,17 @@ SMOKE_LOG     := $(OUTPUT_DIR)/$(TESTNAME)_seed$(SEED).log
 # Bender targets used by the official compile.py
 BENDER_TARGETS := -t cv64a60ax_cvfpu_uvm -t cvfpu_uvm
 
+# PITFALL lint checks — off by default ("nice to have, not part of pass/fail").
+# Override with `make lint PITFALL=on` (or PITFALL=1) to re-enable them when
+# you want a full static-analysis audit. sukimasim's --lint mode implicitly
+# turns them on, so we cancel that with --no-pitfall-checks unless asked.
+PITFALL       ?= off
+ifeq ($(filter on 1 yes true,$(PITFALL)),)
+  PITFALL_FLAG := --no-pitfall-checks
+else
+  PITFALL_FLAG := --pitfall-checks
+endif
+
 # Source the env script once at the top of every recipe that needs PROJECT_DIR
 # / SUKIMASIM_BIN / GMP_DIR / MPFR_DIR. The `source` line MUST sit inside the
 # same shell invocation, hence the leading backslash-newline.
@@ -109,6 +120,8 @@ help:
 	@printf '                   the multiarch GMP/MPFR include paths from env_sukimasim.sh.\n'
 	@printf '    compile        sukimasim --compile-only (parse + IR; no elaboration).\n'
 	@printf '    lint           sukimasim --lint (parse + elaborate; no simulation).\n'
+	@printf '                   PITFALL-* style nags are off by default — pass\n'
+	@printf '                   PITFALL=on to re-enable them for a full audit.\n'
 	@printf '                   Warnings are reported but do NOT fail the build.\n'
 	@printf '    lint-strict    Same as lint, but any warning propagates a non-zero exit.\n'
 	@printf '    smoke          Run +UVM_TESTNAME=%s seed=%s for one transaction.\n' '$(TESTNAME)' '$(SEED)'
@@ -129,6 +142,7 @@ help:
 	@printf '    MAX_TIME       = %s     (sukimasim --max-time, e.g. 1us / 1ms / 10ms)\n' '$(MAX_TIME)'
 	@printf '    WALL_TIMEOUT   = %s     (sukimasim --wall-timeout, seconds)\n' '$(WALL_TIMEOUT)'
 	@printf '    BENDER_TARGETS = %s\n' '$(BENDER_TARGETS)'
+	@printf '    PITFALL        = %s     (off|on; controls --no-pitfall-checks vs --pitfall-checks for `make lint`)\n' '$(PITFALL)'
 	@printf '    SUKIMASIM_BIN  = %s\n' '$(SUKIMASIM_BIN_DISPLAY)'
 	@printf '                   (auto-detected from local/env_sukimasim.sh; set this env\n'
 	@printf '                    var or edit env_sukimasim.sh to point at a different build.)\n'
@@ -149,6 +163,7 @@ help:
 	@printf '    make smoke TESTNAME=fpu_op_group_test SEED=42 WALL_TIMEOUT=120\n'
 	@printf '    SUKIMASIM_BIN=/path/to/sukimasim make compile\n'
 	@printf '    make lint-strict                           # treat lint warnings as errors\n'
+	@printf '    make lint PITFALL=on                       # full audit (re-enable PITFALL-* checks)\n'
 	@printf '    make clean && make all                     # full rebuild from scratch\n'
 	@printf '    make -j2 refmodel bender                   # build independent targets in parallel\n'
 	@printf '\n'
@@ -241,18 +256,19 @@ $(COMPILE_LOG): $(BENDER_FLIST) $(REFMODEL_SO) $(COMPILE_SH) $(ENV_SCRIPT) \
 # Lint is informational — sukimasim returns non-zero whenever it emits any
 # warning, but those warnings are testbench-quality observations, not blocking
 # errors. We tee the full log to lint.log and always succeed so `make all`
-# proceeds to smoke. Use `make lint-strict` to propagate the real exit code.
+# proceeds to smoke. Use `make lint-strict` to propagate the real exit code,
+# or `make lint PITFALL=on` to opt back into the PITFALL-* nag pack.
 #
-lint: $(LINT_LOG)
-lint-strict: STRICT_LINT := 1
-lint-strict: $(LINT_LOG)
-
-$(LINT_LOG): $(BENDER_FLIST) $(REFMODEL_SO) $(ENV_SCRIPT) \
-             $(LOCAL_DIR)/cvfpu_uvm_sukimasim.f
-	@echo "[lint] sukimasim --lint"
+# Both targets are .PHONY so flipping PITFALL re-runs sukimasim instead of
+# satisfying the dependency from a stale lint.log.
+#
+lint lint-strict: | $(BENDER_FLIST) $(REFMODEL_SO) $(ENV_SCRIPT) \
+                    $(LOCAL_DIR)/cvfpu_uvm_sukimasim.f
+	@echo "[lint] sukimasim --lint  (PITFALL=$(PITFALL))"
 	@mkdir -p $(LINT_WORK)
 	@: > $(LINT_LOG)
-	@$(ACTIVATE_ENV); \
+	@strict=0; [ "$@" = "lint-strict" ] && strict=1; \
+	  $(ACTIVATE_ENV); \
 	  set +e; \
 	  "$${SUKIMASIM_BIN}" \
 	    --enable-uvm --preprocess -top top \
@@ -261,10 +277,11 @@ $(LINT_LOG): $(BENDER_FLIST) $(REFMODEL_SO) $(ENV_SCRIPT) \
 	    --lib-path $(dir $(REFMODEL_SO)) --lib $(notdir $(REFMODEL_SO)) \
 	    +define+SUKIMASIM +incdir+$(PROJECT_DIR) \
 	    -f $(LOCAL_DIR)/cvfpu_uvm_sukimasim.f \
+	    $(PITFALL_FLAG) \
 	    --lint 2>&1 | tee -a $(LINT_LOG); \
 	  rc=$${PIPESTATUS[0]}; \
 	  echo "[INFO] sukimasim --lint exit = $${rc}" | tee -a $(LINT_LOG); \
-	  if [ "$${STRICT_LINT:-0}" = "1" ]; then \
+	  if [ "$${strict}" = "1" ]; then \
 	    exit $${rc}; \
 	  else \
 	    echo "[lint] non-zero exit ignored ($${rc}); use 'make lint-strict' to propagate" ; \
