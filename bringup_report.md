@@ -11,7 +11,7 @@
 | repo (upstream) | https://github.com/openhwgroup/cvfpu-uvm.git                   |
 | branch / HEAD   | `sukimasim-bringup` @ `46ff70e`                                |
 | sukimasim       | v0.9.9.2 at `/home/bamba/Work2/sukimasim/build/sukimasim` (HEAD `2c475fe1f`, includes #265 / #281 / #280-part-1 fixes) |
-| reported issues | [#279](https://github.com/kurochan001/sukimasim/issues/279) CLOSED (accepted lint cosmetic), [#280](https://github.com/kurochan001/sukimasim/issues/280) OPEN (iteration-cap FIXED, wall-time follow-up), [#281](https://github.com/kurochan001/sukimasim/issues/281) CLOSED (`2c475fe1f`) |
+| reported issues | [#279](https://github.com/kurochan001/sukimasim/issues/279) CLOSED (accepted lint cosmetic), [#280](https://github.com/kurochan001/sukimasim/issues/280) OPEN (iteration-cap FIXED, scoped to sequencer↔driver handshake), [#281](https://github.com/kurochan001/sukimasim/issues/281) CLOSED (`2c475fe1f`), [#282](https://github.com/kurochan001/sukimasim/issues/282) OPEN (CVFPU two-layer package generate-if not elaborated at runtime → `fpu_ready_o = X`) |
 | user            | pirochan7@outlook.jp                                            |
 
 ## Submodule status
@@ -201,13 +201,16 @@ local/sukimasim_issue_nba_segv_draft.md # body of sukimasim#270 (OPEN)
 local/sukimasim_issue_undriven_in_generate.md  # body of sukimasim#279 (CLOSED accepted)
 local/sukimasim_issue_while_loop_timing.md     # body of sukimasim#280 (OPEN, perf residual)
 local/sukimasim_issue_assignment_lost.md       # body of sukimasim#281 (CLOSED `2c475fe1f`)
-local/repros/                           # 16 SV repros (single-file, sub-second)
+local/repros/                           # 19 SV repros (single-file, sub-second)
   ├── undriven_in_generate.sv          # #279 decisive
   ├── assignment_lost_two_vars.sv      # #281 decisive (Stage 6)
   ├── stage{7..14}_*.sv                # #281 sweep
   ├── assignment_lost_with_alwaysreader.sv
   ├── while_loop_stage{1..4}_*.sv
-  └── int_times_timeunit.sv
+  ├── int_times_timeunit.sv
+  ├── two_layer_pkg_generate_dropped.sv  # #282 stage 1 (PASS — does not repro)
+  ├── two_layer_pkg_with_fsm.sv          # #282 stage 2 (PASS — does not repro)
+  └── two_layer_pkg_via_interface.sv     # #282 stage 3 (PASS — does not repro)
 ref_model_csim/cpp/build/refmodel_csim_lib.so   # gitignored (*.so)
 output/sukimasim/compile.log            # gitignored
 output/sukimasim/lint.log
@@ -251,39 +254,52 @@ source local/env_sukimasim.sh
 
 ## Blockers (ordered)
 
-1. **`main_phase` objection never dropped → `wait (sb.all_done)` hang.**
-   Narrowed via `--uvm-phase-trace --uvm-objection-trace` and a one-shot
-   DEBUG `uvm_info(...,UVM_LOW)` ladder in `base_test::main_phase`
-   (reverted; details on
-   [sukimasim#280#issuecomment-4474441106](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4474441106)):
-   - `[UVM_PHASE_TRACE] start phase=main` + `raise phase=main count=1 total=1`
-     fire, but no matching `drop` ever appears.
-   - DBG ladder confirms `base_sequence.start(env.m_fpu_agent.m_sequencer)`
-     **returns** (the sequence body completes). The next statement,
-     `wait (env.m_fpu_sb.all_done == 1'b1)`, is where execution stops.
-   - `set_drain_time(1500)` then keeps the test waiting forever for an
-     `all_done` flag the scoreboard never raises.
-   - So the chain that needs to deliver the one transaction back to
-     the scoreboard — driver writes the DUT → DUT outputs → monitor
-     samples → monitor's `analysis_port.write(item)` → scoreboard's
-     `write()` — is broken somewhere downstream of the sequencer.
-   - TIMEOUT phrasing also changed from
-     `during combinational evaluation (entry)` to
-     `during run loop time advance`, so the scheduler **is** advancing
-     time. Throughput is ~100 sim clock cycles per host second — slow
-     but no longer the primary symptom.
-   - Most likely a sukimasim UVM `analysis_port` / virtual-interface
-     clocking delivery gap (commercial sims run the same source fine);
-     alternative is something in the cv_dv_utils monitor wiring that
-     only surfaces under sukimasim. Either way the fix is upstream.
-2. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
+1. **`fpu_ready_o = X` after RESET DONE — DUT does not drive.**
+   Tracked as [sukimasim#282](https://github.com/kurochan001/sukimasim/issues/282).
+   DBG ladder added to `fpu_monitor::collect_reqs` observed 9000+
+   `@(posedge clk_i)` edges with `valid_i=0, ready_o=x` after
+   `[RESET DONE]`. `fpu_wrap`'s `if (CVA6Cfg.FpPresent) begin : fpu_gen`
+   block contains the `always_comb / always_ff` that initialises
+   `state_q <= READY` and drives `fpu_ready_o = 1'b1`, so `ready_o = X`
+   means the generate body is either not elaborated or its
+   `always_ff` is not firing on reset.
+   - `--dump-hierarchy` lists `fpu_wrap` but never `fpnew_top`,
+     `i_fpnew_bulk`, or the `fpu_gen` label, even though
+     `fpnew_top.sv` is on the bender filelist and
+     `--list-unresolved` reports zero unresolved modules.
+   - Three single-file repros in `local/repros/two_layer_pkg_*.sv`
+     (2-pkg chain alone / + always_ff+always_comb FSM / + clock and
+     reset from interface output ports) all elaborate cleanly and
+     drive `out_o = 1`. So the trigger is *something* more than the
+     CVA6-style two-layer package config; candidates being chased
+     upstream are: `parameter type` ports (`fu_data_t`, `exception_t`),
+     the 355-file build closure, and UVM-driven phase activity.
+2. **`main_phase` objection never dropped → `wait (sb.all_done)` hang
+   (downstream consequence of #1, plus a sequencer/driver handshake
+   side).** Tracked as the residual on
+   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4474534418),
+   now scoped to the `start_item` / `finish_item` ↔ `get_next_item`
+   handoff.
+   - `[UVM_PHASE_TRACE]`/`[UVM_OBJECTION_TRACE]`: phase=main `raise`
+     fires, no `drop`.
+   - DBG ladder in `base_test::main_phase`: `base_sequence.start()`
+     *returns* (sequence body completes its
+     `start_item; finish_item` loop), yet the driver's
+     `seq_item_port.get_next_item()` never unblocks. So either
+     `start_item` short-circuits without enqueuing into the
+     sequencer arbiter, or the queue path `start_item` pushes into
+     differs from the one `get_next_item` pops from in this
+     sukimasim build.
+   - Even with that handshake fixed, blocker #1 keeps `ready_o = x`,
+     so `send_req`'s `do @(posedge clk_i); while (!ready_o)` would
+     never exit. Both need to land.
+3. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
    form and `--uvm-verbosity UVM_HIGH` flag leave `uvm_info(..., UVM_HIGH)`
    messages unprinted, while `UVM_LOW` messages with the same id do
-   print. Flagged on the same #280 comment as a parking-lot finding;
-   may warrant its own issue.
-3. **`--profile` reports no data.** `--profile` outputs
-   `[PROFILE] No profiling data collected.` after >60 s of UVM-driven
-   simulation. Also parked on #280.
+   print. Parked on the #280 follow-up; may warrant its own issue.
+4. **`--profile` reports no data.** `--profile` outputs
+   `[PROFILE] No profiling data collected.` after >60 s of
+   UVM-driven simulation. Also parked on #280.
 
 ### Resolved (kept for history)
 
@@ -339,21 +355,30 @@ source local/env_sukimasim.sh
 
 ## Status
 
-**SMOKE_HANGS_IN_SB_ALL_DONE_WAIT**  (was `SMOKE_ADVANCES_MAIN_PHASE_NO_TXN`)
+**SMOKE_DUT_NOT_DRIVEN_AND_HANDSHAKE_BYPASS**
+(was `SMOKE_HANGS_IN_SB_ALL_DONE_WAIT`)
 
 Reason:
 - Compile + lint (PITFALL=off) PASS green, regression-tracked in `make all`.
-- sukimasim #265 / #270 / #281 all closed; the iteration-cap side of
-  #280 is closed (test added). `clk_high` programs correctly and the
-  clock ticks. The sequence body **runs to completion**
-  (`base_sequence.start()` returns), so the sequencer / driver path
-  is at least partially alive.
-- The remaining gap is downstream of the sequence: the scoreboard's
-  `all_done` flag never goes high, so `wait (sb.all_done)` in
-  `base_test::main_phase` hangs and the test's main-phase objection
-  is never dropped. That is consistent with the
-  monitor → analysis-port → scoreboard chain not delivering the
-  observed transaction — almost certainly an upstream (sukimasim)
-  `analysis_port.write()` or virtual-interface clocking-event
-  delivery gap. Filed as the
-  [sukimasim#280 residual](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4474441106).
+- sukimasim #265 / #270 / #279 / #281 all closed; the iteration-cap
+  side of #280 is closed (test added). `clk_high` programs correctly
+  and the clock actually ticks (`fpu_monitor` observes 9000+
+  `@(posedge clk_i)` edges).
+- Two cleanly-separated remaining issues, both upstream of cvfpu-uvm:
+  - **#282** — `fpu_ready_o = X` for the entire run after `[RESET DONE]`.
+    `fpu_wrap`'s `if (CVA6Cfg.FpPresent) begin : fpu_gen` is either
+    not elaborated or its `always_ff`/`always_comb` does not fire on
+    reset. Three single-file repros tried in `local/repros/` all
+    elaborate fine, so the trigger is in CVFPU-specific
+    elaboration territory (type parameters / 355-file build / UVM
+    activity).
+  - **#280 (scoped)** — `start_item; finish_item` in the sequence
+    body returns without ever waking the driver's
+    `seq_item_port.get_next_item()`. Sequence body
+    *runs to completion* but no item flows through the agent, so
+    `monitor.ap_fpu_req.write()` is called 0 times and the test's
+    main-phase objection is never dropped.
+
+Both are necessary for `make smoke` to drive even a single
+transaction. They are independent — fixing only one leaves the
+smoke still hanging.
