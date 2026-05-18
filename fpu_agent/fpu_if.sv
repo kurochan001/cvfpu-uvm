@@ -24,7 +24,7 @@
  *  History       :
  */
 
-interface fpu_if (input bit clk_i, input bit rst_ni);
+interface fpu_if (input wire bit clk_i, input wire bit rst_ni);
 import fpu_common_pkg::*;
 
     // Request Port
@@ -46,7 +46,7 @@ import fpu_common_pkg::*;
   // ------------------------------------------------------------------------
   // Delay Task
   // ------------------------------------------------------------------------
-  task wait_n_clocks( int N );          // pragma tbx xtf
+  task automatic wait_n_clocks( int N );          // pragma tbx xtf
     begin
       if( N > 0) begin
         @(posedge clk_i);
