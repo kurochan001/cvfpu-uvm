@@ -251,22 +251,39 @@ source local/env_sukimasim.sh
 
 ## Blockers (ordered)
 
-1. **`main_phase` + 16 ms with zero transaction completed.** The smoke
-   reaches `main_phase`, sukimasim no longer hits the iteration cap,
-   no crash and no UVM_ERROR/UVM_FATAL — but `fpu_random_test`'s
-   sequence does not visibly produce items, and the run wall-times in
-   combinational evaluation around 120 s of host time per ~16 ms of
-   sim time. Tracked as the residual on
-   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4474165817).
-   Hypotheses for the next narrow:
-   - sukimasim's combinational region cost (cycles spent re-evaluating
-     after each `#1ns` clock tick) is the dominant wall-time consumer
-     even though the testbench is logically idle (no items in flight);
-   - or the `fpu_random_test` sequence is in fact stalled on a `wait`
-     that never fires (e.g. a `uvm_config_db` handle still null).
-     Distinguishing the two needs `+UVM_VERBOSITY=UVM_HIGH` or a
-     `--uvm-phase-trace` run, plus a probe on `fpu_vif.fpu_valid_i`.
-2. *(none beyond the above — see Resolved below for prior blockers.)*
+1. **`main_phase` objection never dropped → `wait (sb.all_done)` hang.**
+   Narrowed via `--uvm-phase-trace --uvm-objection-trace` and a one-shot
+   DEBUG `uvm_info(...,UVM_LOW)` ladder in `base_test::main_phase`
+   (reverted; details on
+   [sukimasim#280#issuecomment-4474441106](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4474441106)):
+   - `[UVM_PHASE_TRACE] start phase=main` + `raise phase=main count=1 total=1`
+     fire, but no matching `drop` ever appears.
+   - DBG ladder confirms `base_sequence.start(env.m_fpu_agent.m_sequencer)`
+     **returns** (the sequence body completes). The next statement,
+     `wait (env.m_fpu_sb.all_done == 1'b1)`, is where execution stops.
+   - `set_drain_time(1500)` then keeps the test waiting forever for an
+     `all_done` flag the scoreboard never raises.
+   - So the chain that needs to deliver the one transaction back to
+     the scoreboard — driver writes the DUT → DUT outputs → monitor
+     samples → monitor's `analysis_port.write(item)` → scoreboard's
+     `write()` — is broken somewhere downstream of the sequencer.
+   - TIMEOUT phrasing also changed from
+     `during combinational evaluation (entry)` to
+     `during run loop time advance`, so the scheduler **is** advancing
+     time. Throughput is ~100 sim clock cycles per host second — slow
+     but no longer the primary symptom.
+   - Most likely a sukimasim UVM `analysis_port` / virtual-interface
+     clocking delivery gap (commercial sims run the same source fine);
+     alternative is something in the cv_dv_utils monitor wiring that
+     only surfaces under sukimasim. Either way the fix is upstream.
+2. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
+   form and `--uvm-verbosity UVM_HIGH` flag leave `uvm_info(..., UVM_HIGH)`
+   messages unprinted, while `UVM_LOW` messages with the same id do
+   print. Flagged on the same #280 comment as a parking-lot finding;
+   may warrant its own issue.
+3. **`--profile` reports no data.** `--profile` outputs
+   `[PROFILE] No profiling data collected.` after >60 s of UVM-driven
+   simulation. Also parked on #280.
 
 ### Resolved (kept for history)
 
@@ -322,14 +339,21 @@ source local/env_sukimasim.sh
 
 ## Status
 
-**SMOKE_ADVANCES_MAIN_PHASE_NO_TXN**  (was `SMOKE_NBA_SEGV_POST_265`)
+**SMOKE_HANGS_IN_SB_ALL_DONE_WAIT**  (was `SMOKE_ADVANCES_MAIN_PHASE_NO_TXN`)
 
 Reason:
 - Compile + lint (PITFALL=off) PASS green, regression-tracked in `make all`.
 - sukimasim #265 / #270 / #281 all closed; the iteration-cap side of
-  #280 is closed (test added). The smoke now reaches `main_phase` and
-  the clock actually ticks (`clk_high=500`), but
-  `fpu_random_test` does not produce a completed transaction within
-  ~16 ms of sim time / 120 s of wall time. That is the only thing
-  between the current state and a green smoke; it is upstream
-  (sukimasim) in nature and tracked on the residual of #280.
+  #280 is closed (test added). `clk_high` programs correctly and the
+  clock ticks. The sequence body **runs to completion**
+  (`base_sequence.start()` returns), so the sequencer / driver path
+  is at least partially alive.
+- The remaining gap is downstream of the sequence: the scoreboard's
+  `all_done` flag never goes high, so `wait (sb.all_done)` in
+  `base_test::main_phase` hangs and the test's main-phase objection
+  is never dropped. That is consistent with the
+  monitor → analysis-port → scoreboard chain not delivering the
+  observed transaction — almost certainly an upstream (sukimasim)
+  `analysis_port.write()` or virtual-interface clocking-event
+  delivery gap. Filed as the
+  [sukimasim#280 residual](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4474441106).
