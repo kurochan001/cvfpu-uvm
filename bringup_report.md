@@ -255,44 +255,50 @@ source local/env_sukimasim.sh
 
 ## Blockers (ordered)
 
-1. **FPU pipeline response not propagating — `FPU_SB_REQ` arrives but
-   `FPU_SB_RSP` never does** (plus an in-progress request-side
-   regression observed on the latest WIP binary).
+1. **`fpu_valid_o` from FPU pipeline is never asserted →
+   `FPU_SB_RSP` never fires.**
    Tracked on
-   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4477335316)
-   (response side) and
-   [#issuecomment-4478045917](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4478045917)
-   (request-side regression on `mtime 22:07` WIP).
-   - **18:48 binary (`Issue280WaitZeroTaskJoinAny` only)**: one
-     transaction walks the full request path
-     `driver → DUT inputs → monitor → analysis_port → scoreboard`:
-     ```
-     @ 50501 [TEST] main_phase
-     @ 51501 fpu_monitor [DBG] MON-REQ seen at 51ns
-     @ 51501 fpu_sb      [FPU_SB_REQ] OP=ADD, OP_A=0(x), ...
-     [TIMEOUT] ... at time 84501
-     ```
-     `FPU_SB_RSP` never arrives — response chain inside
-     `fpu_gen.i_fpnew_bulk` (`fpnew_top`) is not propagating
-     `out_valid` back to the monitor. Wall/sim ratio ~600× so
-     stretching `WALL_TIMEOUT` only buys microseconds of sim.
-   - **22:07 binary (+ `Issue280VifPackedStructMemberNba`,
-     `Issue280GenerateChildPortScope`, fpnew cast-actual WIP)**:
-     `[DISABLE FORK]` still gone, but the request now no longer
-     reaches the monitor either — `MON-REQ` count goes from 1 to
-     0 on plain `make smoke` (UVM_LOW, seed=1, no VCD). VCD-on
-     attempt produces a 0-byte VCD because the run is wall-killed
-     before the writer flushes, so I cannot reproduce codex's
-     "VCD 付きで FPU_SB_REQ 到達" path locally. Waiting on codex
-     for the exact VCD invocation or for the WIP edits to be
-     bisected.
+   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4482192325).
+   Latest in-tree binary (`mtime 04:44`, WIP includes
+   `Issue280VifPackedStructMemberNba`,
+   `Issue280GenerateChildPortScope`, fork-context VIF NBA fix).
+   - Confirmed module-scope `always @(posedge clk)` watchers in
+     `tb_top.sv` (non-UVM, plain `$display`) that:
+     - `fpu_ready_o` drives `1` at 0-2 ns (so `fpu_gen` is alive
+       and the FSM is in `READY`),
+     - `fpu_valid_o` is **never** `1` across the full run,
+   - Therefore `fpu_monitor::collect_resps`' `if (fpu_valid_o)`
+     branch never executes; nothing is written into
+     `ap_fpu_rsp`; scoreboard's `all_done` flag never flips.
+   - The hot path is somewhere in `fpu_gen.i_fpnew_bulk`
+     (`fpnew_top` / its `gen_operation_groups[*]` /
+     `i_opgroup_block`); codex narrowed earlier that
+     `gen_operation_groups[0].in_valid -> i_opgroup_block.in_valid_i`
+     propagation is incomplete on the current WIP.
+
+   **Observability paradox** while diagnosing this:
+
+   | DBG style | `[DISABLE FORK]` |
+   |---|---|
+   | none (plain canonical `make smoke`)                                  | 0 |
+   | `uvm_info("DBG", …, UVM_LOW)` inside `fpu_monitor::collect_reqs`     | many (loops, log → MB) |
+   | plain `$display(...)` in `tb_top` `always @(posedge clk)` (non-UVM) | 0 |
+
+   So touching the UVM monitor class re-fires the `[DISABLE FORK]`
+   zero-delay loop in spite of `Issue280WaitZeroTaskJoinAny`; this
+   matches codex's earlier note that broadening the
+   generate-child-port sync had the same effect. Module-scope
+   `$display` watchers stay safe.
 
    **Earlier residuals folded into Resolved** (in time order, all
    now upstream-fixed): `q_inflight_tid` "not an array" →
    `pre_body $cast` fix; `Constraint solver timeout` on
    `$countones(...) == K` → solver capacity fix;
    `[DISABLE FORK]` zero-delay loop → `wait(0)` in
-   task/block-continuation fix.
+   task/block-continuation fix; stripped VIF packed-struct NBA in
+   fork context → driver request payload now reaches the
+   scoreboard (request-side WIP regression from yesterday is
+   resolved on `mtime 04:44`).
 
 2. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
    form and `--uvm-verbosity UVM_HIGH` flag leave `uvm_info(..., UVM_HIGH)`
@@ -392,8 +398,8 @@ source local/env_sukimasim.sh
 
 ## Status
 
-**SMOKE_FPU_RESPONSE_NOT_PROPAGATING_PLUS_WIP_REQ_REGRESSION**
-(was `SMOKE_FPU_RESPONSE_NOT_PROPAGATING`)
+**SMOKE_FPU_VALID_O_NEVER_ASSERTED**
+(was `SMOKE_FPU_RESPONSE_NOT_PROPAGATING_PLUS_WIP_REQ_REGRESSION`)
 
 Reason:
 - Compile + lint (PITFALL=off) PASS green, regression-tracked in
