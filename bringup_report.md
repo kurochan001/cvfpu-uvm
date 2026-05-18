@@ -10,8 +10,8 @@
 | repo (origin)   | https://github.com/kurochan001/cvfpu-uvm.git (fork, private)   |
 | repo (upstream) | https://github.com/openhwgroup/cvfpu-uvm.git                   |
 | branch / HEAD   | `sukimasim-bringup` @ `46ff70e`                                |
-| sukimasim       | v0.9.9.2 at `/home/bamba/Work2/sukimasim/build/sukimasim` (HEAD `2c475fe1f`, includes #265 / #281 / #280-part-1 fixes) |
-| reported issues | [#279](https://github.com/kurochan001/sukimasim/issues/279) CLOSED (accepted lint cosmetic), [#280](https://github.com/kurochan001/sukimasim/issues/280) OPEN (iteration-cap FIXED, scoped to sequencer↔driver handshake + comb-eval residual), [#281](https://github.com/kurochan001/sukimasim/issues/281) CLOSED (`2c475fe1f`), [#282](https://github.com/kurochan001/sukimasim/issues/282) LOCAL-FIX-VERIFIED (struct-parameter `if`-generate recovery; commit pending) |
+| sukimasim       | v0.9.9.2 at `/home/bamba/Work2/sukimasim/build/sukimasim` (HEAD `41a4e053d`, includes #265 / #281 / #282 / #280-part-1+2 fixes) |
+| reported issues | [#279](https://github.com/kurochan001/sukimasim/issues/279) CLOSED (accepted lint cosmetic), [#280](https://github.com/kurochan001/sukimasim/issues/280) OPEN (iteration-cap + sequence loop entry both FIXED, scoped to constraint-solver capacity on `$countones` + nested `dist`), [#281](https://github.com/kurochan001/sukimasim/issues/281) CLOSED (`2c475fe1f`), [#282](https://github.com/kurochan001/sukimasim/issues/282) CLOSED (`f2d32ddba`) |
 | user            | pirochan7@outlook.jp                                            |
 
 ## Submodule status
@@ -254,30 +254,35 @@ source local/env_sukimasim.sh
 
 ## Blockers (ordered)
 
-1. **`main_phase` objection never dropped → `wait (sb.all_done)`
-   hang, plus combinational-eval timeout after `fpu_gen` is
-   elaborated.** Tracked on
-   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280)
-   (scoped to sequencer↔driver handshake + post-fix comb-eval
-   residual).
-   - Before #282 local fix: `fpu_ready_o = x` for 9000+ edges
-     because `fpu_gen` was never elaborated; sim advanced 16 ms in
-     120 s wall before timing out.
-   - After #282 local fix: `fpu_gen` body elaborates (debug log
-     shows `[GEN_UNINST_MEMBER] i_fpnew_bulk`,
-     `[LOCALPARAM_HIERARCHICAL] Stored fpu_gen.FPU_FEATURES`,
-     `fpnew_top` walk including `gen_nanbox_check[0..4]`). Sim now
-     wall-times at **sim_time ≈ 94 ns** — combinational evaluation
-     of the FPU pipeline dominates. Expected: more work per delta
-     cycle once `fpnew_top` is actually elaborated.
-   - The handshake observation is unchanged: `[UVM_PHASE_TRACE]`
-     shows `phase=main raise` with no `drop`;
-     `base_sequence.start()` returns but the driver's
-     `seq_item_port.get_next_item()` never unblocks; analysis-port
-     `write()` count remains 0.
-   - Both pieces (`start_item`↔`get_next_item` handoff, and the new
-     comb-eval throughput in `fpnew_top`) need to land before the
-     smoke completes a transaction.
+1. **`fpu_txn::randomize()` exhausts sukimasim's constraint solver.**
+   Tracked on
+   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4475106535).
+   With `41a4e053d`, `fpu_random_op_seq::body()` reaches
+   `item.randomize()` and the solver runs for ~170 s of wall before
+   emitting:
+   ```
+   [WARNING] Constraint solver timeout after 4000 attempts (hard constraints only, treating as failure)
+   ...
+   [UVM_FATAL] @ 50501: fpu_random_op_seq [body] Randomization failed
+   ```
+   So the sim **completes naturally** (not wall-killed) — the
+   testbench's own `uvm_fatal("body","Randomization failed")` fires
+   when `item.randomize()` returns 0.
+   Constraint-set shape that the solver is hammering on
+   (`fpu_agent/fpu_txn.svh:99..218`):
+   - 9 weighted `dist` constraints (mostly 3-entry foreach arrays),
+   - 3-deep `foreach (m_fp_op_type[i])` with `->` implications,
+   - bit-level expressions: `$countones(mantissa) == 1`,
+     `== 22` (FP32), `== 51` (FP64),
+   - cross-variable equalities aliasing `m_operand_a` to
+     `m_fp_*_operands[0]`,
+   - 3 `solve … before …` orderings,
+   - `m_trans_id inside {q_inflight_tid}` against an associative
+     array.
+   The combination most likely to drive 4000-retry exhaustion is
+   the `$countones(mantissa) == K` family under `WALKING_ONE` /
+   `WALKING_ZERO`, plus the 64-bit cross-variable equality that
+   reaches into the same mantissa.
 2. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
    form and `--uvm-verbosity UVM_HIGH` flag leave `uvm_info(..., UVM_HIGH)`
    messages unprinted, while `UVM_LOW` messages with the same id do
@@ -288,15 +293,27 @@ source local/env_sukimasim.sh
 
 ### Resolved (kept for history)
 
+- **#280 (parts 1 & 2) — timed-while iteration cap; UVM sequence
+  loop entry.** Part 1 CLOSED earlier in `2c475fe1f`
+  (timed-while guard now counts only consecutive same-time
+  iterations). Part 2 CLOSED in
+  [`41a4e053d`](https://github.com/kurochan001/sukimasim/commit/41a4e053d):
+  `for (int i = 0; i < num_txn; i++)` no longer skips the first
+  iteration when `num_txn` arrived through `$value$plusargs("%d",
+  class int member)` (`+NB_TXNS=1`); the value's type is preserved
+  and the narrow-unsigned vs. signed-loop-variable compare no
+  longer treats the value as negative. Regression test
+  `BugFix.Issue280UvmSequencePlusargLoop`.
 - **#282 — CVFPU two-layer-package generate-if branch dropped at IR
-  conversion.** Root cause: `if (CVA6Cfg.FpPresent)` recovery for an
+  conversion.** CLOSED in
+  [`f2d32ddba`](https://github.com/kurochan001/sukimasim/commit/f2d32ddba).
+  Root cause: `if (CVA6Cfg.FpPresent)` recovery for an
   `isUninstantiated` block was guarded by a non-empty integer
   parameter map, which a `struct`-typed parameter never populates.
   Fix routes through slang's constant evaluator first. Verified
   reporter-side via `SUKIMASIM_DEBUG_GENERATE=1` log
   (`fpu_gen.i_fpnew_bulk`, `fpnew_top.gen_nanbox_check[*]` now
-  walked). Commit pending on sukimasim side; `bringup_report` will
-  fold this into Resolved-with-commit-SHA on next rebuild.
+  walked).
 
 
 - **#265 — null class-handle method dispatch → SIGSEGV.** CLOSED by
@@ -351,26 +368,27 @@ source local/env_sukimasim.sh
 
 ## Status
 
-**SMOKE_FPU_GEN_ELABORATED_HANDSHAKE_RESIDUAL**
-(was `SMOKE_DUT_NOT_DRIVEN_AND_HANDSHAKE_BYPASS`)
+**SMOKE_CONSTRAINT_SOLVER_LIMIT_ON_RANDOMIZE**
+(was `SMOKE_FPU_GEN_ELABORATED_HANDSHAKE_RESIDUAL`)
 
 Reason:
 - Compile + lint (PITFALL=off) PASS green, regression-tracked in `make all`.
-- sukimasim #265 / #270 / #279 / #281 all closed.
-- **#282 local fix verified reporter-side**: `fpu_gen` body now
-  elaborates, `fpnew_top` walked, `i_fpnew_bulk` registered as a
-  generate member. Awaiting the sukimasim-side commit before
-  promoting to a CLOSED bullet.
-- One remaining issue (`#280`) gates the smoke:
-  - **handshake**: sequence body's
-    `start_item; finish_item` returns without ever waking the
-    driver's `seq_item_port.get_next_item()`; agent
-    `analysis_port.write()` count stays 0.
-  - **post-fix throughput**: now that `fpnew_top` actually
-    elaborates, sim_time gets to ~94 ns in 45 s of wall — the
-    combinational evaluation cost of the freshly-elaborated FPU
-    pipeline is the new dominant consumer.
-
-`make smoke` driving a single transaction needs the #280 handshake
-fix (so item flows) plus enough comb-eval throughput to complete it
-inside `WALL_TIMEOUT`.
+- sukimasim #265 / #270 / #279 / #281 / #282 all closed; #280
+  parts 1 & 2 closed (regressions
+  `BugFix.Issue280TimedWhileLoopProgress` +
+  `BugFix.Issue280UvmSequencePlusargLoop`).
+- The smoke now **completes naturally** rather than being
+  wall-killed: `fpu_random_op_seq::body()` reaches `item.randomize()`,
+  sukimasim's constraint solver runs ~170 s of wall and emits
+  `Constraint solver timeout after 4000 attempts`, and the
+  testbench's own `uvm_fatal("body","Randomization failed")` ends
+  the run. So sukimasim is no longer "stuck": it diagnoses its
+  own solver capacity ceiling.
+- The remaining gap to a green smoke is the solver's ability to
+  satisfy the `fpu_txn` constraint set — in particular
+  `$countones(mantissa) == K` (K ∈ {1, 22, 51}) under
+  `WALKING_ONE` / `WALKING_ZERO` distribution implications, cross-
+  variable equality aliasing `m_operand_a` to the same mantissa
+  vector, and a 3-deep `foreach` over `m_fp_op_type[i]`. This is
+  the residual on
+  [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4475106535).
