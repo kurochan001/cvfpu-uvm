@@ -201,7 +201,7 @@ local/sukimasim_issue_nba_segv_draft.md # body of sukimasim#270 (OPEN)
 local/sukimasim_issue_undriven_in_generate.md  # body of sukimasim#279 (CLOSED accepted)
 local/sukimasim_issue_while_loop_timing.md     # body of sukimasim#280 (OPEN, perf residual)
 local/sukimasim_issue_assignment_lost.md       # body of sukimasim#281 (CLOSED `2c475fe1f`)
-local/repros/                           # 19 SV repros (single-file, sub-second)
+local/repros/                           # 20 SV repros (single-file, sub-second)
   ├── undriven_in_generate.sv          # #279 decisive
   ├── assignment_lost_two_vars.sv      # #281 decisive (Stage 6)
   ├── stage{7..14}_*.sv                # #281 sweep
@@ -210,7 +210,8 @@ local/repros/                           # 19 SV repros (single-file, sub-second)
   ├── int_times_timeunit.sv
   ├── two_layer_pkg_generate_dropped.sv  # #282 stage 1 (PASS — does not repro)
   ├── two_layer_pkg_with_fsm.sv          # #282 stage 2 (PASS — does not repro)
-  └── two_layer_pkg_via_interface.sv     # #282 stage 3 (PASS — does not repro)
+  ├── two_layer_pkg_via_interface.sv     # #282 stage 3 (PASS — does not repro)
+  └── wait_zero_in_join_any.sv           # #280 disable-fork loop attempt (PASS — does not repro)
 ref_model_csim/cpp/build/refmodel_csim_lib.so   # gitignored (*.so)
 output/sukimasim/compile.log            # gitignored
 output/sukimasim/lint.log
@@ -254,56 +255,71 @@ source local/env_sukimasim.sh
 
 ## Blockers (ordered)
 
-1. **`fpu_txn::randomize()` exhausts sukimasim's constraint solver.**
+1. **`[DISABLE FORK]` zero-delay loop after `main_phase` is reached.**
    Tracked on
-   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4475106535).
-   With `41a4e053d`, `fpu_random_op_seq::body()` reaches
-   `item.randomize()` and the solver runs for ~170 s of wall before
-   emitting:
+   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4475958542).
+   With the local in-tree (uncommitted) fixes for
+   `Issue280CountonesStructMemberConstraint` and
+   `Issue280UvmPreBodyCastMember` on top of pushed `41a4e053d`,
+   the run advances past constraint solving and the previous
+   `uvm_fatal("body","Randomization failed")` is gone. Now, around
+   `time 50501` (right after `[TEST] main_phase` UVM_INFO),
+   sukimasim self-emits:
    ```
-   [WARNING] Constraint solver timeout after 4000 attempts (hard constraints only, treating as failure)
-   ...
-   [UVM_FATAL] @ 50501: fpu_random_op_seq [body] Randomization failed
+   [DISABLE FORK] Terminating forked processes in context 4 at time 50501
+   [DISABLE FORK] Context-scoped disable complete
+   ... (×31 in a 60 s wall budget) ...
    ```
-   So the sim **completes naturally** (not wall-killed) — the
-   testbench's own `uvm_fatal("body","Randomization failed")` fires
-   when `item.randomize()` returns 0.
-   Constraint-set shape that the solver is hammering on
-   (`fpu_agent/fpu_txn.svh:99..218`):
-   - 9 weighted `dist` constraints (mostly 3-entry foreach arrays),
-   - 3-deep `foreach (m_fp_op_type[i])` with `->` implications,
-   - bit-level expressions: `$countones(mantissa) == 1`,
-     `== 22` (FP32), `== 51` (FP64),
-   - cross-variable equalities aliasing `m_operand_a` to
-     `m_fp_*_operands[0]`,
-   - 3 `solve … before …` orderings,
-   - `m_trans_id inside {q_inflight_tid}` against an associative
-     array.
-   The combination most likely to drive 4000-retry exhaustion is
-   the `$countones(mantissa) == K` family under `WALKING_ONE` /
-   `WALKING_ZERO`, plus the 64-bit cross-variable equality that
-   reaches into the same mantissa.
+   with no sim_time advance, generating a ~42 MB log. The
+   `base_test::main_phase` shape is
+   `do begin fork MAIN_THREAD; FLUSH_THREAD; RESET_THREAD; join_any
+   disable fork; end while(!all_done)` and all three arms have
+   `wait(...)` paths that should block forever on seed=1; one of
+   them is being treated as instantly complete by sukimasim. The
+   single-file repro
+   `local/repros/wait_zero_in_join_any.sv` does **not** reproduce
+   in isolation, so the trigger has CVFPU-specific state in it
+   (most likely the UVM sequencer/driver path under
+   `base_sequence.start()`).
+
+   **Earlier residuals folded into Resolved** (in time order, all
+   now upstream-fixed): `q_inflight_tid` "not an array" →
+   `pre_body $cast` fix; `Constraint solver timeout` on
+   `$countones(...) == K` → solver capacity fix.
+
 2. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
    form and `--uvm-verbosity UVM_HIGH` flag leave `uvm_info(..., UVM_HIGH)`
    messages unprinted, while `UVM_LOW` messages with the same id do
    print. Parked on the #280 follow-up; may warrant its own issue.
+   Hampers diagnosing the `[DISABLE FORK]` loop in blocker #1
+   because the per-arm `Inside main/flush/reset thread` traces never
+   fire.
 3. **`--profile` reports no data.** `--profile` outputs
    `[PROFILE] No profiling data collected.` after >60 s of
    UVM-driven simulation. Also parked on #280.
 
 ### Resolved (kept for history)
 
-- **#280 (parts 1 & 2) — timed-while iteration cap; UVM sequence
-  loop entry.** Part 1 CLOSED earlier in `2c475fe1f`
-  (timed-while guard now counts only consecutive same-time
-  iterations). Part 2 CLOSED in
-  [`41a4e053d`](https://github.com/kurochan001/sukimasim/commit/41a4e053d):
-  `for (int i = 0; i < num_txn; i++)` no longer skips the first
+- **#280 (parts 1 & 2 & 3 & 4) — multiple incremental fixes that
+  walk the smoke through `main_phase`.**
+  Part 1: `2c475fe1f` — timed-while iteration cap now counts only
+  consecutive same-time iterations; valid `while (enable) #delay`
+  clock generators no longer trip the 10 000-iteration guard.
+  Part 2: [`41a4e053d`](https://github.com/kurochan001/sukimasim/commit/41a4e053d)
+  — `for (int i = 0; i < num_txn; i++)` no longer skips the first
   iteration when `num_txn` arrived through `$value$plusargs("%d",
-  class int member)` (`+NB_TXNS=1`); the value's type is preserved
-  and the narrow-unsigned vs. signed-loop-variable compare no
-  longer treats the value as negative. Regression test
-  `BugFix.Issue280UvmSequencePlusargLoop`.
+  class int member)`; the type/sign of the value is preserved so
+  the comparison against a signed loop variable no longer treats
+  it as negative.
+  Parts 3 & 4 (local, pre-commit): the constraint solver now
+  handles `$countones(struct_member) == K` even when the
+  `foreach` iterator is anchored on a separate control array,
+  and task-form `$cast(...)` inside a UVM sequence `pre_body()`
+  now writes simple identifier cast targets back to inherited
+  class members (`my_sequencer`). Regressions:
+  `Issue280TimedWhileLoopProgress`, `Issue280UvmSequencePlusargLoop`,
+  `Issue280CountonesStructMemberConstraint`,
+  `Issue280UvmPreBodyCastMember`.
 - **#282 — CVFPU two-layer-package generate-if branch dropped at IR
   conversion.** CLOSED in
   [`f2d32ddba`](https://github.com/kurochan001/sukimasim/commit/f2d32ddba).
@@ -368,27 +384,29 @@ source local/env_sukimasim.sh
 
 ## Status
 
-**SMOKE_CONSTRAINT_SOLVER_LIMIT_ON_RANDOMIZE**
-(was `SMOKE_FPU_GEN_ELABORATED_HANDSHAKE_RESIDUAL`)
+**SMOKE_DISABLE_FORK_ZERO_DELAY_LOOP_IN_MAIN_PHASE**
+(was `SMOKE_CONSTRAINT_SOLVER_LIMIT_ON_RANDOMIZE`)
 
 Reason:
-- Compile + lint (PITFALL=off) PASS green, regression-tracked in `make all`.
-- sukimasim #265 / #270 / #279 / #281 / #282 all closed; #280
-  parts 1 & 2 closed (regressions
-  `BugFix.Issue280TimedWhileLoopProgress` +
-  `BugFix.Issue280UvmSequencePlusargLoop`).
-- The smoke now **completes naturally** rather than being
-  wall-killed: `fpu_random_op_seq::body()` reaches `item.randomize()`,
-  sukimasim's constraint solver runs ~170 s of wall and emits
-  `Constraint solver timeout after 4000 attempts`, and the
-  testbench's own `uvm_fatal("body","Randomization failed")` ends
-  the run. So sukimasim is no longer "stuck": it diagnoses its
-  own solver capacity ceiling.
-- The remaining gap to a green smoke is the solver's ability to
-  satisfy the `fpu_txn` constraint set — in particular
-  `$countones(mantissa) == K` (K ∈ {1, 22, 51}) under
-  `WALKING_ONE` / `WALKING_ZERO` distribution implications, cross-
-  variable equality aliasing `m_operand_a` to the same mantissa
-  vector, and a 3-deep `foreach` over `m_fp_op_type[i]`. This is
-  the residual on
-  [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4475106535).
+- Compile + lint (PITFALL=off) PASS green, regression-tracked in
+  `make all`.
+- sukimasim #265 / #270 / #279 / #281 / #282 closed; #280 parts
+  1–4 either landed or locally fixed (`Issue280TimedWhileLoopProgress`,
+  `Issue280UvmSequencePlusargLoop`, `Issue280CountonesStructMember
+  Constraint`, `Issue280UvmPreBodyCastMember`).
+- The smoke no longer fatals from constraint-solver timeout; the
+  testbench-side `uvm_fatal("body","Randomization failed")` is
+  gone.
+- New blocker: at `time 50501` (right after `[TEST] main_phase`),
+  sukimasim self-emits `[DISABLE FORK]` 31× per ~60 s wall budget
+  with **no sim_time advance**. One of the three arms of
+  `base_test::main_phase`'s `do begin fork ... join_any disable
+  fork; end while(!all_done)` is being treated as instantly
+  complete, even though all three arms have `wait(...)` paths that
+  should block forever on seed=1 (`reset_on_the_fly` and
+  `flush_on_the_fly` are 10 %-90 % dist; seed=1 hits the 90 %
+  branch with `else wait(0)`).
+- Single-file repro for the suspected pattern
+  (`local/repros/wait_zero_in_join_any.sv`) does NOT reproduce in
+  isolation, so a CVFPU-specific state (likely the
+  `base_sequence.start()` path under UVM) is part of the trigger.
