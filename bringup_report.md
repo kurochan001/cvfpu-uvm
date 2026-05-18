@@ -11,7 +11,7 @@
 | repo (upstream) | https://github.com/openhwgroup/cvfpu-uvm.git                   |
 | branch / HEAD   | `sukimasim-bringup` @ `46ff70e`                                |
 | sukimasim       | v0.9.9.2 at `/home/bamba/Work2/sukimasim/build/sukimasim` (HEAD `2c475fe1f`, includes #265 / #281 / #280-part-1 fixes) |
-| reported issues | [#279](https://github.com/kurochan001/sukimasim/issues/279) CLOSED (accepted lint cosmetic), [#280](https://github.com/kurochan001/sukimasim/issues/280) OPEN (iteration-cap FIXED, scoped to sequencer↔driver handshake), [#281](https://github.com/kurochan001/sukimasim/issues/281) CLOSED (`2c475fe1f`), [#282](https://github.com/kurochan001/sukimasim/issues/282) OPEN (CVFPU two-layer package generate-if not elaborated at runtime → `fpu_ready_o = X`) |
+| reported issues | [#279](https://github.com/kurochan001/sukimasim/issues/279) CLOSED (accepted lint cosmetic), [#280](https://github.com/kurochan001/sukimasim/issues/280) OPEN (iteration-cap FIXED, scoped to sequencer↔driver handshake + comb-eval residual), [#281](https://github.com/kurochan001/sukimasim/issues/281) CLOSED (`2c475fe1f`), [#282](https://github.com/kurochan001/sukimasim/issues/282) LOCAL-FIX-VERIFIED (struct-parameter `if`-generate recovery; commit pending) |
 | user            | pirochan7@outlook.jp                                            |
 
 ## Submodule status
@@ -254,54 +254,50 @@ source local/env_sukimasim.sh
 
 ## Blockers (ordered)
 
-1. **`fpu_ready_o = X` after RESET DONE — DUT does not drive.**
-   Tracked as [sukimasim#282](https://github.com/kurochan001/sukimasim/issues/282).
-   DBG ladder added to `fpu_monitor::collect_reqs` observed 9000+
-   `@(posedge clk_i)` edges with `valid_i=0, ready_o=x` after
-   `[RESET DONE]`. `fpu_wrap`'s `if (CVA6Cfg.FpPresent) begin : fpu_gen`
-   block contains the `always_comb / always_ff` that initialises
-   `state_q <= READY` and drives `fpu_ready_o = 1'b1`, so `ready_o = X`
-   means the generate body is either not elaborated or its
-   `always_ff` is not firing on reset.
-   - `--dump-hierarchy` lists `fpu_wrap` but never `fpnew_top`,
-     `i_fpnew_bulk`, or the `fpu_gen` label, even though
-     `fpnew_top.sv` is on the bender filelist and
-     `--list-unresolved` reports zero unresolved modules.
-   - Three single-file repros in `local/repros/two_layer_pkg_*.sv`
-     (2-pkg chain alone / + always_ff+always_comb FSM / + clock and
-     reset from interface output ports) all elaborate cleanly and
-     drive `out_o = 1`. So the trigger is *something* more than the
-     CVA6-style two-layer package config; candidates being chased
-     upstream are: `parameter type` ports (`fu_data_t`, `exception_t`),
-     the 355-file build closure, and UVM-driven phase activity.
-2. **`main_phase` objection never dropped → `wait (sb.all_done)` hang
-   (downstream consequence of #1, plus a sequencer/driver handshake
-   side).** Tracked as the residual on
-   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280#issuecomment-4474534418),
-   now scoped to the `start_item` / `finish_item` ↔ `get_next_item`
-   handoff.
-   - `[UVM_PHASE_TRACE]`/`[UVM_OBJECTION_TRACE]`: phase=main `raise`
-     fires, no `drop`.
-   - DBG ladder in `base_test::main_phase`: `base_sequence.start()`
-     *returns* (sequence body completes its
-     `start_item; finish_item` loop), yet the driver's
-     `seq_item_port.get_next_item()` never unblocks. So either
-     `start_item` short-circuits without enqueuing into the
-     sequencer arbiter, or the queue path `start_item` pushes into
-     differs from the one `get_next_item` pops from in this
-     sukimasim build.
-   - Even with that handshake fixed, blocker #1 keeps `ready_o = x`,
-     so `send_req`'s `do @(posedge clk_i); while (!ready_o)` would
-     never exit. Both need to land.
-3. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
+1. **`main_phase` objection never dropped → `wait (sb.all_done)`
+   hang, plus combinational-eval timeout after `fpu_gen` is
+   elaborated.** Tracked on
+   [sukimasim#280](https://github.com/kurochan001/sukimasim/issues/280)
+   (scoped to sequencer↔driver handshake + post-fix comb-eval
+   residual).
+   - Before #282 local fix: `fpu_ready_o = x` for 9000+ edges
+     because `fpu_gen` was never elaborated; sim advanced 16 ms in
+     120 s wall before timing out.
+   - After #282 local fix: `fpu_gen` body elaborates (debug log
+     shows `[GEN_UNINST_MEMBER] i_fpnew_bulk`,
+     `[LOCALPARAM_HIERARCHICAL] Stored fpu_gen.FPU_FEATURES`,
+     `fpnew_top` walk including `gen_nanbox_check[0..4]`). Sim now
+     wall-times at **sim_time ≈ 94 ns** — combinational evaluation
+     of the FPU pipeline dominates. Expected: more work per delta
+     cycle once `fpnew_top` is actually elaborated.
+   - The handshake observation is unchanged: `[UVM_PHASE_TRACE]`
+     shows `phase=main raise` with no `drop`;
+     `base_sequence.start()` returns but the driver's
+     `seq_item_port.get_next_item()` never unblocks; analysis-port
+     `write()` count remains 0.
+   - Both pieces (`start_item`↔`get_next_item` handoff, and the new
+     comb-eval throughput in `fpnew_top`) need to land before the
+     smoke completes a transaction.
+2. **`+UVM_VERBOSITY=UVM_HIGH` plusarg ignored.** Both the plusarg
    form and `--uvm-verbosity UVM_HIGH` flag leave `uvm_info(..., UVM_HIGH)`
    messages unprinted, while `UVM_LOW` messages with the same id do
    print. Parked on the #280 follow-up; may warrant its own issue.
-4. **`--profile` reports no data.** `--profile` outputs
+3. **`--profile` reports no data.** `--profile` outputs
    `[PROFILE] No profiling data collected.` after >60 s of
    UVM-driven simulation. Also parked on #280.
 
 ### Resolved (kept for history)
+
+- **#282 — CVFPU two-layer-package generate-if branch dropped at IR
+  conversion.** Root cause: `if (CVA6Cfg.FpPresent)` recovery for an
+  `isUninstantiated` block was guarded by a non-empty integer
+  parameter map, which a `struct`-typed parameter never populates.
+  Fix routes through slang's constant evaluator first. Verified
+  reporter-side via `SUKIMASIM_DEBUG_GENERATE=1` log
+  (`fpu_gen.i_fpnew_bulk`, `fpnew_top.gen_nanbox_check[*]` now
+  walked). Commit pending on sukimasim side; `bringup_report` will
+  fold this into Resolved-with-commit-SHA on next rebuild.
+
 
 - **#265 — null class-handle method dispatch → SIGSEGV.** CLOSED by
   `d99e191f6` (`Fix null class handle method calls`).
@@ -355,30 +351,26 @@ source local/env_sukimasim.sh
 
 ## Status
 
-**SMOKE_DUT_NOT_DRIVEN_AND_HANDSHAKE_BYPASS**
-(was `SMOKE_HANGS_IN_SB_ALL_DONE_WAIT`)
+**SMOKE_FPU_GEN_ELABORATED_HANDSHAKE_RESIDUAL**
+(was `SMOKE_DUT_NOT_DRIVEN_AND_HANDSHAKE_BYPASS`)
 
 Reason:
 - Compile + lint (PITFALL=off) PASS green, regression-tracked in `make all`.
-- sukimasim #265 / #270 / #279 / #281 all closed; the iteration-cap
-  side of #280 is closed (test added). `clk_high` programs correctly
-  and the clock actually ticks (`fpu_monitor` observes 9000+
-  `@(posedge clk_i)` edges).
-- Two cleanly-separated remaining issues, both upstream of cvfpu-uvm:
-  - **#282** — `fpu_ready_o = X` for the entire run after `[RESET DONE]`.
-    `fpu_wrap`'s `if (CVA6Cfg.FpPresent) begin : fpu_gen` is either
-    not elaborated or its `always_ff`/`always_comb` does not fire on
-    reset. Three single-file repros tried in `local/repros/` all
-    elaborate fine, so the trigger is in CVFPU-specific
-    elaboration territory (type parameters / 355-file build / UVM
-    activity).
-  - **#280 (scoped)** — `start_item; finish_item` in the sequence
-    body returns without ever waking the driver's
-    `seq_item_port.get_next_item()`. Sequence body
-    *runs to completion* but no item flows through the agent, so
-    `monitor.ap_fpu_req.write()` is called 0 times and the test's
-    main-phase objection is never dropped.
+- sukimasim #265 / #270 / #279 / #281 all closed.
+- **#282 local fix verified reporter-side**: `fpu_gen` body now
+  elaborates, `fpnew_top` walked, `i_fpnew_bulk` registered as a
+  generate member. Awaiting the sukimasim-side commit before
+  promoting to a CLOSED bullet.
+- One remaining issue (`#280`) gates the smoke:
+  - **handshake**: sequence body's
+    `start_item; finish_item` returns without ever waking the
+    driver's `seq_item_port.get_next_item()`; agent
+    `analysis_port.write()` count stays 0.
+  - **post-fix throughput**: now that `fpnew_top` actually
+    elaborates, sim_time gets to ~94 ns in 45 s of wall — the
+    combinational evaluation cost of the freshly-elaborated FPU
+    pipeline is the new dominant consumer.
 
-Both are necessary for `make smoke` to drive even a single
-transaction. They are independent — fixing only one leaves the
-smoke still hanging.
+`make smoke` driving a single transaction needs the #280 handshake
+fix (so item flows) plus enough comb-eval throughput to complete it
+inside `WALL_TIMEOUT`.
